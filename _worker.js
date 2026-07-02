@@ -1,7 +1,7 @@
 // _worker.js
 
 // Docker镜像仓库主机地址
-let hub_host = 'hub.docker.404060.xyz';
+let hub_host = 'registry-1.docker.io';
 // Docker认证服务器地址
 let auth_url = 'https://auth.docker.io';
 
@@ -438,7 +438,6 @@ export default {
 		const workers_url = `https://${url.hostname}`;
 		if (env.HUB_HOST) hub_host = env.HUB_HOST;
 		if (env.AUTH_URL) auth_url = env.AUTH_URL;
-		else if (hub_host !== 'registry-1.docker.io') auth_url = `https://${hub_host}`;
 		const authHost = new URL(auth_url).host;
 
 		// 获取请求参数中的 ns
