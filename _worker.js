@@ -1,9 +1,9 @@
 // _worker.js
 
 // Docker镜像仓库主机地址
-let hub_host = 'registry-1.docker.io';
+let hub_host = 'hub.docker.404060.xyz';
 // Docker认证服务器地址
-const auth_url = 'https://auth.docker.io';
+let auth_url = 'https://auth.docker.io';
 
 let 屏蔽爬虫UA = ['netcraft'];
 
@@ -62,6 +62,21 @@ function newUrl(urlStr, base) {
 		console.error(err);
 		return null // 构造失败返回null
 	}
+}
+
+function rewriteAuthRealm(wwwAuthenticate, workersUrl) {
+	if (!wwwAuthenticate) return wwwAuthenticate;
+	return wwwAuthenticate.replace(/realm="https?:\/\/[^"]+"/i, `realm="${workersUrl}/token"`);
+}
+
+function resolveTokenAuthorization(request, env) {
+	if (request.headers.has("Authorization")) {
+		return request.headers.get("Authorization");
+	}
+	if (env?.DOCKERHUB_USERNAME && env?.DOCKERHUB_PASSWORD) {
+		return `Basic ${btoa(`${env.DOCKERHUB_USERNAME}:${env.DOCKERHUB_PASSWORD}`)}`;
+	}
+	return null;
 }
 
 async function nginx() {
@@ -414,12 +429,17 @@ async function searchInterface() {
 export default {
 	async fetch(request, env, ctx) {
 		const getReqHeader = (key) => request.headers.get(key); // 获取请求头
+		const upstreamEncoding = 'identity';
 
 		let url = new URL(request.url); // 解析请求URL
 		const userAgentHeader = request.headers.get('User-Agent');
 		const userAgent = userAgentHeader ? userAgentHeader.toLowerCase() : "null";
 		if (env.UA) 屏蔽爬虫UA = 屏蔽爬虫UA.concat(await ADD(env.UA));
 		const workers_url = `https://${url.hostname}`;
+		if (env.HUB_HOST) hub_host = env.HUB_HOST;
+		if (env.AUTH_URL) auth_url = env.AUTH_URL;
+		else if (hub_host !== 'registry-1.docker.io') auth_url = `https://${hub_host}`;
+		const authHost = new URL(auth_url).host;
 
 		// 获取请求参数中的 ns
 		const ns = url.searchParams.get('ns');
@@ -494,19 +514,23 @@ export default {
 			console.log(`handle_url: ${url}`);
 		}
 
+		const needDockerAuth = (hub_host === 'registry-1.docker.io') && !(env?.NO_DOCKER_AUTH === '1' || env?.NO_DOCKER_AUTH === 'true');
+
 		// 处理token请求
 		if (url.pathname.includes('/token')) {
+			const tokenAuthorization = resolveTokenAuthorization(request, env);
 			let token_parameter = {
 				headers: {
-					'Host': 'auth.docker.io',
+					'Host': authHost,
 					'User-Agent': getReqHeader("User-Agent"),
 					'Accept': getReqHeader("Accept"),
 					'Accept-Language': getReqHeader("Accept-Language"),
-					'Accept-Encoding': getReqHeader("Accept-Encoding"),
+					'Accept-Encoding': upstreamEncoding,
 					'Connection': 'keep-alive',
 					'Cache-Control': 'max-age=0'
 				}
 			};
+			if (tokenAuthorization) token_parameter.headers.Authorization = tokenAuthorization;
 			let token_url = auth_url + url.pathname + url.search;
 			return fetch(new Request(token_url, request), token_parameter);
 		}
@@ -518,8 +542,9 @@ export default {
 			console.log(`modified_url: ${url.pathname}`);
 		}
 
-		// 新增：/v2/、/manifests/、/blobs/、/tags/ 先获取token再请求
+		// 新增：/v2/、/manifests/、/blobs/、/tags/ 先获取token再请求（Docker 官方上游才需要）
 		if (
+			needDockerAuth &&
 			url.pathname.startsWith('/v2/') &&
 			(
 				url.pathname.includes('/manifests/') ||
@@ -535,17 +560,18 @@ export default {
 				repo = v2Match[1];
 			}
 			if (repo) {
+				const tokenAuthorization = resolveTokenAuthorization(request, env);
 				const tokenUrl = `${auth_url}/token?service=registry.docker.io&scope=repository:${repo}:pull`;
-				const tokenRes = await fetch(tokenUrl, {
-					headers: {
-						'User-Agent': getReqHeader("User-Agent"),
-						'Accept': getReqHeader("Accept"),
-						'Accept-Language': getReqHeader("Accept-Language"),
-						'Accept-Encoding': getReqHeader("Accept-Encoding"),
-						'Connection': 'keep-alive',
-						'Cache-Control': 'max-age=0'
-					}
-				});
+				const tokenHeaders = {
+					'User-Agent': getReqHeader("User-Agent"),
+					'Accept': getReqHeader("Accept"),
+					'Accept-Language': getReqHeader("Accept-Language"),
+					'Accept-Encoding': upstreamEncoding,
+					'Connection': 'keep-alive',
+					'Cache-Control': 'max-age=0'
+				};
+				if (tokenAuthorization) tokenHeaders.Authorization = tokenAuthorization;
+				const tokenRes = await fetch(tokenUrl, { headers: tokenHeaders });
 				const tokenData = await tokenRes.json();
 				const token = tokenData.token;
 				let parameter = {
@@ -554,7 +580,7 @@ export default {
 						'User-Agent': getReqHeader("User-Agent"),
 						'Accept': getReqHeader("Accept"),
 						'Accept-Language': getReqHeader("Accept-Language"),
-						'Accept-Encoding': getReqHeader("Accept-Encoding"),
+						'Accept-Encoding': upstreamEncoding,
 						'Connection': 'keep-alive',
 						'Cache-Control': 'max-age=0',
 						'Authorization': `Bearer ${token}`
@@ -571,9 +597,8 @@ export default {
 				let new_response_headers = new Headers(response_headers);
 				let status = original_response.status;
 				if (new_response_headers.get("Www-Authenticate")) {
-					let auth = new_response_headers.get("Www-Authenticate");
-					let re = new RegExp(auth_url, 'g');
-					new_response_headers.set("Www-Authenticate", response_headers.get("Www-Authenticate").replace(re, workers_url));
+					const authHeader = response_headers.get("Www-Authenticate");
+					new_response_headers.set("Www-Authenticate", rewriteAuthRealm(authHeader, workers_url));
 				}
 				if (new_response_headers.get("Location")) {
 					const location = new_response_headers.get("Location");
@@ -595,7 +620,7 @@ export default {
 				'User-Agent': getReqHeader("User-Agent"),
 				'Accept': getReqHeader("Accept"),
 				'Accept-Language': getReqHeader("Accept-Language"),
-				'Accept-Encoding': getReqHeader("Accept-Encoding"),
+				'Accept-Encoding': upstreamEncoding,
 				'Connection': 'keep-alive',
 				'Cache-Control': 'max-age=0'
 			},
@@ -622,9 +647,8 @@ export default {
 
 		// 修改 Www-Authenticate 头
 		if (new_response_headers.get("Www-Authenticate")) {
-			let auth = new_response_headers.get("Www-Authenticate");
-			let re = new RegExp(auth_url, 'g');
-			new_response_headers.set("Www-Authenticate", response_headers.get("Www-Authenticate").replace(re, workers_url));
+			const authHeader = response_headers.get("Www-Authenticate");
+			new_response_headers.set("Www-Authenticate", rewriteAuthRealm(authHeader, workers_url));
 		}
 
 		// 处理重定向
